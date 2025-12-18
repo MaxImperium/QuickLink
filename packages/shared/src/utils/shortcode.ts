@@ -1,107 +1,96 @@
 /**
  * Short Code Generation Module
  *
- * Generates unique, URL-safe short codes for the QuickLink URL shortener.
+ * ═══════════════════════════════════════════════════════════════════════════
+ * SINGLE SOURCE OF TRUTH
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * This file is the ONLY implementation of short code generation in QuickLink.
+ * Any other shortcode.ts files are legacy duplicates and should be deleted.
+ *
+ * Canonical location: packages/shared/src/utils/shortcode.ts
+ * Design document:    packages/shared/SHORTCODE_DESIGN.md
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * ┌─────────────────────────────────────────────────────────────────────────┐
+ * │ RESPONSIBILITIES                                                        │
+ * ├─────────────────────────────────────────────────────────────────────────┤
+ * │ 1. GENERATION  - Random Base62 code creation                           │
+ * │ 2. VALIDATION  - Format and blocklist checking                         │
+ * │ 3. UTILITIES   - Base62 encoding/decoding helpers                      │
+ * └─────────────────────────────────────────────────────────────────────────┘
  *
  * Strategy: Random Base62
- * - Length: 7 characters (3.5 trillion combinations)
- * - Alphabet: a-zA-Z0-9 (62 characters)
- * - Collision handling: Check + retry (max 5 attempts)
+ * - Length: 7 characters (62^7 = ~3.5 trillion combinations)
+ * - Alphabet: 0-9A-Za-z (62 URL-safe characters)
+ * - Collision handling: Blocklist check → DB check → Retry (max 5)
  *
- * Why Random Base62?
- * 1. Unpredictable - can't enumerate links (security)
- * 2. No coordination - scales horizontally
- * 3. Multi-region safe - no central ID service needed
- * 4. Simple operations - just generate + check existence
+ * Why Cryptographic Randomness?
+ * - Unpredictable: Cannot enumerate or guess valid short codes
+ * - Secure: No information leakage about link creation order
+ * - Distributed: No coordination needed between servers
  *
- * Trade-offs:
- * - Requires collision check (but probability is ~0.003% at 100M links)
- * - Slightly longer codes than sequential (but more secure)
+ * Why Retry on Collision?
+ * - At 100M links, collision probability is ~0.003% per generation
+ * - 5 consecutive collisions probability: (0.00003)^5 ≈ 0
+ * - Simpler than distributed ID generation (Snowflake, etc.)
+ *
+ * @see SHORTCODE_DESIGN.md for full specification
  */
 
 import { webcrypto } from "node:crypto";
-import { SHORTCODE_BLOCKLIST } from "../constants/blocklist.js";
+import { SHORTCODE_CONFIG } from "../constants/index.js";
+import { SHORTCODE_BLOCKLIST, containsBlockedContent } from "../constants/blocklist.js";
 
 // =============================================================================
-// Constants
+// TYPES
 // =============================================================================
 
 /**
- * URL-safe Base62 alphabet
- * Using all alphanumeric characters for maximum density
+ * Result of a validation operation
  */
-const BASE62_ALPHABET =
-  "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-
-/**
- * Default short code length
- * 7 chars = 62^7 = 3.5 trillion combinations
- * Safe until ~35 billion links (1% fill rate)
- */
-export const DEFAULT_CODE_LENGTH = 7;
-
-/**
- * Minimum custom alias length
- */
-export const MIN_CUSTOM_LENGTH = 4;
-
-/**
- * Maximum custom alias length
- */
-export const MAX_CUSTOM_LENGTH = 30;
-
-/**
- * Maximum generation attempts before failing
- */
-const MAX_GENERATION_ATTEMPTS = 5;
-
-// =============================================================================
-// Types
-// =============================================================================
-
-export interface GenerateOptions {
-  /** Code length (default: 7) */
-  length?: number;
-  /** Function to check if code exists */
-  existsCheck?: (code: string) => Promise<boolean>;
-}
-
-export interface GenerationResult {
-  /** Generated short code */
-  code: string;
-  /** Number of attempts taken */
-  attempts: number;
-}
-
 export interface ValidationResult {
-  /** Whether the code/alias is valid */
+  /** Whether the input is valid */
   valid: boolean;
-  /** Error message if invalid */
+  /** Human-readable error message if invalid */
   error?: string;
 }
 
+/**
+ * Function signature for checking code existence in database
+ */
+export type ExistsChecker = (code: string) => Promise<boolean>;
+
 // =============================================================================
-// Generation Functions
+// SECTION 1: GENERATION
 // =============================================================================
 
 /**
- * Generate a random short code.
+ * Generate a random Base62 short code.
  *
- * Uses cryptographically secure random bytes for unpredictability.
+ * Uses `crypto.getRandomValues()` for cryptographically secure randomness.
+ * This prevents enumeration attacks where attackers try to guess valid codes.
  *
- * @param length - Code length (default: 7)
+ * @param length - Code length (default: from SHORTCODE_CONFIG)
  * @returns Random Base62 string
+ *
+ * @example
+ * ```ts
+ * const code = generateRandomCode();    // "aB3xY9k"
+ * const longer = generateRandomCode(10); // "aB3xY9kM2p"
+ * ```
  */
-export function generateRandomCode(length: number = DEFAULT_CODE_LENGTH): string {
-  // Use crypto for secure randomness
+export function generateRandomCode(length: number = SHORTCODE_CONFIG.DEFAULT_LENGTH): string {
   const bytes = new Uint8Array(length);
   webcrypto.getRandomValues(bytes);
 
   let code = "";
   for (let i = 0; i < length; i++) {
-    // Map byte to alphabet index (0-61)
-    const index = bytes[i] % BASE62_ALPHABET.length;
-    code += BASE62_ALPHABET[index];
+    // Map byte (0-255) to alphabet index (0-61)
+    // Note: Slight bias (256 % 62 = 8) is acceptable for URL shortening
+    const index = bytes[i] % SHORTCODE_CONFIG.ALPHABET.length;
+    code += SHORTCODE_CONFIG.ALPHABET[index];
   }
 
   return code;
@@ -110,83 +99,106 @@ export function generateRandomCode(length: number = DEFAULT_CODE_LENGTH): string
 /**
  * Generate a unique short code with collision detection.
  *
- * Flow:
+ * Collision Handling Flow:
  * 1. Generate random code
- * 2. Check blocklist
- * 3. Check existence (if checker provided)
- * 4. Retry on collision (max 5 attempts)
+ * 2. Check blocklist (fast, in-memory) → if blocked, retry
+ * 3. Check database existence → if exists, retry
+ * 4. Return code (caller should INSERT with unique constraint as final safety)
  *
- * @param options - Generation options
- * @returns Generated code and attempt count
- * @throws Error if max attempts exceeded
+ * Retry Limits:
+ * - Max 5 attempts (from SHORTCODE_CONFIG.MAX_RETRIES)
+ * - Throws error if all attempts fail (astronomically rare)
+ *
+ * @param existsCheck - Async function to check if code exists in database
+ * @param length - Code length (default: from SHORTCODE_CONFIG)
+ * @returns Promise resolving to unique code string
+ * @throws Error if max retries exceeded (indicates system issue)
+ *
+ * @example
+ * ```ts
+ * const code = await generateUniqueCode(
+ *   async (code) => db.links.exists({ where: { code } })
+ * );
+ * ```
  */
 export async function generateUniqueCode(
-  options: GenerateOptions = {}
-): Promise<GenerationResult> {
-  const { length = DEFAULT_CODE_LENGTH, existsCheck } = options;
+  existsCheck: ExistsChecker,
+  length: number = SHORTCODE_CONFIG.DEFAULT_LENGTH
+): Promise<string> {
+  const maxRetries = SHORTCODE_CONFIG.MAX_RETRIES;
 
-  for (let attempt = 1; attempt <= MAX_GENERATION_ATTEMPTS; attempt++) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
     const code = generateRandomCode(length);
 
-    // Check blocklist first (fast, in-memory)
+    // Step 1: Blocklist check (fast, no DB call)
     if (isBlockedCode(code)) {
-      continue; // Generate new code
+      continue;
     }
 
-    // Check existence if checker provided
-    if (existsCheck) {
-      const exists = await existsCheck(code);
-      if (exists) {
-        continue; // Collision, generate new code
-      }
+    // Step 2: Database existence check
+    const exists = await existsCheck(code);
+    if (exists) {
+      continue;
     }
 
-    // Success!
-    return { code, attempts: attempt };
+    // Success - code is available
+    return code;
   }
 
-  // This should be astronomically rare
+  // This should never happen under normal operation
+  // If it does, it indicates either extreme load or a bug
   throw new Error(
-    `Failed to generate unique code after ${MAX_GENERATION_ATTEMPTS} attempts`
+    `Failed to generate unique short code after ${maxRetries} attempts. ` +
+    `This may indicate extremely high collision rate or system issue.`
   );
 }
 
 // =============================================================================
-// Validation Functions
+// SECTION 2: VALIDATION
 // =============================================================================
 
 /**
  * Validate an auto-generated short code format.
  *
- * Rules:
- * - Exactly 7 alphanumeric characters
- * - Not in blocklist
+ * Rules (from SHORTCODE_DESIGN.md):
+ * - Exactly DEFAULT_LENGTH (7) alphanumeric characters
+ * - Not in blocklist (exact match, case-insensitive)
  *
- * @param code - Code to validate
- * @returns Validation result
+ * @param code - Short code to validate
+ * @returns Validation result with error message if invalid
+ *
+ * @example
+ * ```ts
+ * validateShortCode("aB3xY9k")  // { valid: true }
+ * validateShortCode("admin")   // { valid: false, error: "..." }
+ * ```
  */
 export function validateShortCode(code: string): ValidationResult {
+  const { DEFAULT_LENGTH, ALPHABET } = SHORTCODE_CONFIG;
+
   // Length check
-  if (code.length !== DEFAULT_CODE_LENGTH) {
+  if (code.length !== DEFAULT_LENGTH) {
     return {
       valid: false,
-      error: `Code must be exactly ${DEFAULT_CODE_LENGTH} characters`,
+      error: `Short code must be exactly ${DEFAULT_LENGTH} characters`,
     };
   }
 
-  // Character check (alphanumeric only)
-  if (!/^[a-zA-Z0-9]+$/.test(code)) {
-    return {
-      valid: false,
-      error: "Code must contain only alphanumeric characters",
-    };
+  // Character check (Base62 only)
+  for (const char of code) {
+    if (!ALPHABET.includes(char)) {
+      return {
+        valid: false,
+        error: "Short code must contain only alphanumeric characters (a-z, A-Z, 0-9)",
+      };
+    }
   }
 
-  // Blocklist check
+  // Blocklist check (exact match)
   if (isBlockedCode(code)) {
     return {
       valid: false,
-      error: "Code is reserved or blocked",
+      error: "This short code is reserved",
     };
   }
 
@@ -194,54 +206,64 @@ export function validateShortCode(code: string): ValidationResult {
 }
 
 /**
- * Validate a custom alias (user-provided).
+ * Validate a user-provided custom alias.
  *
- * Rules:
- * - 4-30 characters
- * - Alphanumeric, hyphens, underscores only
- * - Not in blocklist
- * - No leading/trailing hyphens or underscores
+ * Stricter rules than auto-generated codes (from SHORTCODE_DESIGN.md):
+ * - Length: 3-30 characters
+ * - Characters: a-zA-Z0-9, hyphen (-), underscore (_)
+ * - Must start and end with alphanumeric character
+ * - Not in blocklist (exact match)
+ * - No profanity (substring match)
  *
- * @param alias - Alias to validate
- * @returns Validation result
+ * @param alias - Custom alias to validate
+ * @returns Validation result with error message if invalid
+ *
+ * @example
+ * ```ts
+ * validateCustomAlias("my-link")    // { valid: true }
+ * validateCustomAlias("-invalid")   // { valid: false, error: "..." }
+ * validateCustomAlias("admin")      // { valid: false, error: "..." }
+ * ```
  */
 export function validateCustomAlias(alias: string): ValidationResult {
+  const { MIN_LENGTH, MAX_LENGTH, PATTERN } = SHORTCODE_CONFIG.CUSTOM_ALIAS;
+
   // Length check
-  if (alias.length < MIN_CUSTOM_LENGTH) {
+  if (alias.length < MIN_LENGTH) {
     return {
       valid: false,
-      error: `Alias must be at least ${MIN_CUSTOM_LENGTH} characters`,
+      error: `Custom alias must be at least ${MIN_LENGTH} characters`,
     };
   }
 
-  if (alias.length > MAX_CUSTOM_LENGTH) {
+  if (alias.length > MAX_LENGTH) {
     return {
       valid: false,
-      error: `Alias must be at most ${MAX_CUSTOM_LENGTH} characters`,
+      error: `Custom alias must be at most ${MAX_LENGTH} characters`,
     };
   }
 
-  // Character check (alphanumeric, hyphen, underscore)
-  if (!/^[a-zA-Z0-9_-]+$/.test(alias)) {
+  // Pattern check (alphanumeric, hyphens, underscores; must start/end with alphanumeric)
+  if (!PATTERN.test(alias)) {
     return {
       valid: false,
-      error: "Alias can only contain letters, numbers, hyphens, and underscores",
+      error: "Custom alias must start and end with a letter or number, and contain only letters, numbers, hyphens, and underscores",
     };
   }
 
-  // No leading/trailing special characters
-  if (/^[-_]|[-_]$/.test(alias)) {
-    return {
-      valid: false,
-      error: "Alias cannot start or end with hyphen or underscore",
-    };
-  }
-
-  // Blocklist check
+  // Blocklist check (exact match)
   if (isBlockedCode(alias)) {
     return {
       valid: false,
-      error: "This alias is reserved or not allowed",
+      error: "This alias is reserved and cannot be used",
+    };
+  }
+
+  // Profanity check (substring match - stricter for user input)
+  if (containsBlockedContent(alias)) {
+    return {
+      valid: false,
+      error: "This alias contains restricted content",
     };
   }
 
@@ -251,43 +273,56 @@ export function validateCustomAlias(alias: string): ValidationResult {
 /**
  * Check if a code is in the blocklist.
  *
- * Checks:
- * - Exact match (case-insensitive)
- * - Reserved system routes
+ * Case-insensitive exact match against SHORTCODE_BLOCKLIST.
  *
  * @param code - Code to check
- * @returns true if blocked
+ * @returns true if code is blocked
  */
 export function isBlockedCode(code: string): boolean {
-  const normalized = code.toLowerCase();
-  return SHORTCODE_BLOCKLIST.has(normalized);
+  return SHORTCODE_BLOCKLIST.has(code.toLowerCase());
 }
 
 // =============================================================================
-// Utility Functions
+// SECTION 3: UTILITIES
 // =============================================================================
 
 /**
- * Encode a numeric ID to Base62.
+ * Encode a number to Base62 string.
  *
  * Useful for:
  * - Converting database IDs to short strings
  * - Creating deterministic codes from sequences
  *
- * Note: Not used in primary generation (we use random),
- * but available for special cases.
+ * Note: Primary generation uses random, not sequential encoding.
  *
- * @param num - Number to encode
+ * @param num - Non-negative integer to encode
  * @returns Base62 encoded string
+ * @throws Error if num is negative
+ *
+ * @example
+ * ```ts
+ * encodeBase62(0)     // "0"
+ * encodeBase62(61)    // "z"
+ * encodeBase62(62)    // "10"
+ * encodeBase62(12345) // "3d7"
+ * ```
  */
 export function encodeBase62(num: number): string {
-  if (num === 0) return BASE62_ALPHABET[0];
+  if (num < 0) {
+    throw new Error("Cannot encode negative number to Base62");
+  }
+
+  const { ALPHABET } = SHORTCODE_CONFIG;
+
+  if (num === 0) {
+    return ALPHABET[0];
+  }
 
   let result = "";
   let n = num;
 
   while (n > 0) {
-    result = BASE62_ALPHABET[n % 62] + result;
+    result = ALPHABET[n % 62] + result;
     n = Math.floor(n / 62);
   }
 
@@ -295,19 +330,28 @@ export function encodeBase62(num: number): string {
 }
 
 /**
- * Decode a Base62 string to numeric ID.
+ * Decode a Base62 string to number.
  *
  * @param str - Base62 string to decode
  * @returns Decoded number
+ * @throws Error if string contains invalid characters
+ *
+ * @example
+ * ```ts
+ * decodeBase62("0")   // 0
+ * decodeBase62("z")   // 61
+ * decodeBase62("10")  // 62
+ * decodeBase62("3d7") // 12345
+ * ```
  */
 export function decodeBase62(str: string): number {
+  const { ALPHABET } = SHORTCODE_CONFIG;
   let result = 0;
 
-  for (let i = 0; i < str.length; i++) {
-    const char = str[i];
-    const index = BASE62_ALPHABET.indexOf(char);
+  for (const char of str) {
+    const index = ALPHABET.indexOf(char);
     if (index === -1) {
-      throw new Error(`Invalid Base62 character: ${char}`);
+      throw new Error(`Invalid Base62 character: '${char}'`);
     }
     result = result * 62 + index;
   }
@@ -316,20 +360,26 @@ export function decodeBase62(str: string): number {
 }
 
 /**
- * Calculate collision probability for given parameters.
+ * Estimate collision probability for capacity planning.
  *
- * Uses birthday problem approximation:
- * P(collision) ≈ 1 - e^(-n²/2m)
+ * Formula: P(collision) ≈ existingCount / totalCombinations
  *
- * @param existingCount - Number of existing codes
- * @param codeLength - Length of codes
- * @returns Approximate collision probability per new insert
+ * This is a simplified approximation. For exact birthday problem
+ * calculation, use: P ≈ 1 - e^(-n²/2N)
+ *
+ * @param existingCount - Number of existing codes in database
+ * @param codeLength - Length of codes (default: from config)
+ * @returns Probability as decimal (0.001 = 0.1%)
+ *
+ * @example
+ * ```ts
+ * estimateCollisionProbability(100_000_000) // ~0.00003 (0.003%)
+ * ```
  */
 export function estimateCollisionProbability(
   existingCount: number,
-  codeLength: number = DEFAULT_CODE_LENGTH
+  codeLength: number = SHORTCODE_CONFIG.DEFAULT_LENGTH
 ): number {
   const totalCombinations = Math.pow(62, codeLength);
-  // Simplified: probability ≈ existingCount / totalCombinations
   return existingCount / totalCombinations;
 }
