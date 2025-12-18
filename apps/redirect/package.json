@@ -3,27 +3,34 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
+  "description": "Ultra-low-latency URL redirect service",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "tsup src/index.ts --format esm --dts",
+    "build": "tsup src/index.ts --format esm --dts --clean",
     "start": "node dist/index.js",
     "lint": "eslint src/",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:watch": "vitest",
+    "bench": "tsx src/bench.ts",
     "clean": "rm -rf dist .turbo node_modules"
   },
   "dependencies": {
-    "@quicklink/cache": "workspace:*",
-    "@quicklink/logger": "workspace:*",
-    "@quicklink/shared": "workspace:*",
-    "fastify": "^4.24.0"
+    "hono": "^4.0.0",
+    "@hono/node-server": "^1.8.0",
+    "ioredis": "^5.3.0",
+    "pg": "^8.11.0"
   },
   "devDependencies": {
     "@quicklink/config": "workspace:*",
     "@types/node": "^20.10.0",
+    "@types/pg": "^8.10.0",
     "tsup": "^8.0.0",
     "tsx": "^4.6.0",
     "typescript": "^5.3.0",
     "vitest": "^1.0.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
   }
 }

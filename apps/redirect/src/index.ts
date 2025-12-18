@@ -1,12 +1,12 @@
 /**
  * QuickLink Redirect Service
- * 
- * Ultra-lightweight HTTP service optimized for fast redirects.
- * This service is intentionally minimal to achieve the lowest
- * possible latency for the redirect critical path.
+ *
+ * Ultra-low-latency HTTP redirect service.
+ * This is the entry point - just re-exports server startup.
+ *
+ * Target: <10ms p50 latency, <20ms p99 latency
  */
 
-// Placeholder: Server initialization will be implemented here
-console.log("QuickLink Redirect Service - Starting...");
+// Start the server
+import "./server.js";
 
-export {};
