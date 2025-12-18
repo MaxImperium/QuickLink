@@ -10,8 +10,10 @@
     "start": "node dist/index.js",
     "lint": "eslint src/",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
-    "test:watch": "vitest",
+    "test": "NODE_OPTIONS=--experimental-vm-modules jest",
+    "test:ci": "NODE_OPTIONS=--experimental-vm-modules jest --ci --coverage",
+    "test:coverage": "NODE_OPTIONS=--experimental-vm-modules jest --coverage",
+    "test:watch": "NODE_OPTIONS=--experimental-vm-modules jest --watch",
     "bench": "tsx src/bench.ts",
     "clean": "rm -rf dist .turbo node_modules"
   },
@@ -22,13 +24,16 @@
     "pg": "^8.11.0"
   },
   "devDependencies": {
+    "@jest/globals": "^29.7.0",
     "@quicklink/config": "workspace:*",
+    "@types/jest": "^29.5.12",
     "@types/node": "^20.10.0",
     "@types/pg": "^8.10.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.2",
     "tsup": "^8.0.0",
     "tsx": "^4.6.0",
-    "typescript": "^5.3.0",
-    "vitest": "^1.0.0"
+    "typescript": "^5.3.0"
   },
   "engines": {
     "node": ">=20.0.0"

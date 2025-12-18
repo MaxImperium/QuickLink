@@ -26,12 +26,17 @@
     "test": {
       "dependsOn": ["^build"],
       "outputs": ["coverage/**"],
-      "inputs": ["src/**", "tests/**", "*.config.ts"]
+      "inputs": ["src/**", "__tests__/**", "*.config.ts", "jest.config.ts"]
     },
     "test:ci": {
       "dependsOn": ["^build"],
       "outputs": ["coverage/**"],
-      "inputs": ["src/**", "tests/**", "*.config.ts"]
+      "inputs": ["src/**", "__tests__/**", "*.config.ts", "jest.config.ts"]
+    },
+    "test:coverage": {
+      "dependsOn": ["^build"],
+      "outputs": ["coverage/**"],
+      "inputs": ["src/**", "__tests__/**", "*.config.ts", "jest.config.ts"]
     },
     "clean": {
       "cache": false

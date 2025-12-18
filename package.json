@@ -12,6 +12,7 @@
     "lint": "turbo run lint",
     "test": "turbo run test",
     "test:ci": "turbo run test:ci",
+    "test:coverage": "turbo run test:coverage",
     "typecheck": "turbo run typecheck",
     "clean": "turbo run clean && rm -rf node_modules",
     "format": "prettier --write \"**/*.{ts,tsx,md,json}\"",
@@ -23,10 +24,14 @@
     "prepare": "husky install"
   },
   "devDependencies": {
+    "@jest/globals": "^29.7.0",
+    "@types/jest": "^29.5.12",
     "@types/node": "^20.10.0",
     "husky": "^8.0.3",
+    "jest": "^29.7.0",
     "lint-staged": "^15.2.0",
     "prettier": "^3.1.0",
+    "ts-jest": "^29.1.2",
     "turbo": "^2.0.0",
     "typescript": "^5.3.0"
   },
