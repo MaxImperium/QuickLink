@@ -11,15 +11,15 @@
     "./utils": "./src/utils/index.ts",
     "./constants": "./src/constants/index.ts"
   },
-  "scripts": {
-    "build": "tsup src/index.ts --format esm --dts",
-    "lint": "eslint src/",
-    "typecheck": "tsc --noEmit",
-    "test": "NODE_OPTIONS=--experimental-vm-modules jest",
-    "test:ci": "NODE_OPTIONS=--experimental-vm-modules jest --ci --coverage",
-    "test:coverage": "NODE_OPTIONS=--experimental-vm-modules jest --coverage",
-    "clean": "rm -rf dist .turbo node_modules"
-  },
+    "scripts": {
+        "build": "tsup src/index.ts --format esm --dts",
+        "lint": "eslint src/",
+        "typecheck": "tsc --noEmit",
+        "test": "cross-env NODE_OPTIONS=--experimental-vm-modules jest",
+        "test:ci": "cross-env NODE_OPTIONS=--experimental-vm-modules jest --ci --coverage",
+        "test:coverage": "cross-env NODE_OPTIONS=--experimental-vm-modules jest --coverage",
+        "clean": "rm -rf dist .turbo node_modules"
+    },
   "dependencies": {
     "zod": "^3.22.0"
   },

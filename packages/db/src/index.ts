@@ -18,3 +18,6 @@ export * from "./client.js";
 
 // TypeScript types (for use without Prisma imports)
 export * from "./types.js";
+
+// Analytics queries
+export * from "./analytics.js";
