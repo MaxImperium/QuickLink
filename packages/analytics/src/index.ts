@@ -110,6 +110,40 @@ export {
 } from "./bot-detection.js";
 
 // =============================================================================
+// Distributed Frequency Tracking (Redis-based)
+// =============================================================================
+
+export {
+  DistributedFrequencyTracker,
+  getDistributedFrequencyTracker,
+  initializeFrequencyTracker,
+  shutdownFrequencyTracker,
+} from "./distributed-frequency.js";
+
+export type {
+  FrequencyTrackerConfig,
+  FrequencyCheckResult,
+  FrequencyTrackerStats,
+} from "./distributed-frequency.js";
+
+// =============================================================================
+// IP Reputation Bloom Filter
+// =============================================================================
+
+export {
+  IPReputationBloomFilter,
+  getIPReputationFilter,
+  initializeBloomFilter,
+  shutdownBloomFilter,
+  hashIP,
+} from "./bloom-filter.js";
+
+export type {
+  BloomFilterConfig,
+  BloomFilterStats,
+} from "./bloom-filter.js";
+
+// =============================================================================
 // Aggregation Jobs
 // =============================================================================
 

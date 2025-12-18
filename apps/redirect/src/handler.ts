@@ -142,47 +142,145 @@ function getClientIP(ctx: Context): string | undefined {
 
 /**
  * Cache control header values for CDN compatibility.
- * - Positive redirects: Cache for 1 hour (matches Redis TTL)
- * - 404 responses: Cache for 5 minutes (matches negative cache TTL)
- * - 503 errors: No cache (transient failure)
+ *
+ * Header Meanings:
+ * - public: CDN can cache the response
+ * - max-age: Browser cache duration (seconds)
+ * - s-maxage: CDN cache duration (seconds), overrides max-age for CDNs
+ * - stale-while-revalidate: Serve stale while fetching fresh (seconds)
+ * - stale-if-error: Serve stale if origin returns error (seconds)
+ * - immutable: Content never changes (browser won't revalidate)
+ *
+ * CDN-Specific Headers (set via Surrogate-Control):
+ * - Cloudflare: Uses Cache-Control + cf-cache-status
+ * - Fastly: Uses Surrogate-Control for edge-specific TTLs
+ * - CloudFront: Uses Cache-Control with configurable behaviors
  */
 const CACHE_CONTROL = {
-  REDIRECT_PERMANENT: "public, max-age=3600, s-maxage=3600, stale-while-revalidate=60",
+  // Permanent redirect (301): Long cache, aggressive edge caching
+  // CDN caches for 1 hour, browser for 1 hour, stale for 1 min on revalidate
+  REDIRECT_PERMANENT: "public, max-age=3600, s-maxage=3600, stale-while-revalidate=60, stale-if-error=300",
+
+  // Temporary redirect (302): Shorter cache for more frequent updates
+  // CDN caches for 1 minute, browser for 1 minute
   REDIRECT_TEMPORARY: "public, max-age=60, s-maxage=60, stale-while-revalidate=10",
+
+  // 404 responses: Cache to prevent repeated lookups
+  // CDN caches for 5 minutes (matches negative cache TTL)
   NOT_FOUND: "public, max-age=300, s-maxage=300",
+
+  // 503 errors: No cache (transient failure)
   ERROR: "no-store, no-cache, must-revalidate",
 } as const;
 
 /**
+ * Surrogate-Control headers for CDN-specific behavior.
+ * These override Cache-Control at the edge, not passed to browser.
+ */
+const SURROGATE_CONTROL = {
+  // Permanent redirect: Cache at edge for longer than browser
+  REDIRECT_PERMANENT: "max-age=86400, stale-while-revalidate=3600, stale-if-error=86400",
+
+  // Temporary redirect: Short edge cache
+  REDIRECT_TEMPORARY: "max-age=300, stale-while-revalidate=60",
+
+  // 404: Medium edge cache
+  NOT_FOUND: "max-age=600",
+} as const;
+
+/**
+ * CDN cache tags for targeted invalidation.
+ * Format: quicklink:link:{shortCode}
+ */
+function getCacheTag(shortCode: string): string {
+  return `quicklink:link:${shortCode}`;
+}
+
+/**
  * Create a redirect response with CDN-compatible headers.
+ *
+ * Headers included:
+ * - Location: Redirect destination
+ * - Cache-Control: Browser and CDN caching
+ * - Surrogate-Control: CDN-specific caching (Fastly, Varnish)
+ * - Surrogate-Key / Cache-Tag: For cache invalidation
+ * - Server-Timing: For debugging and RUM
+ * - Vary: Cache key variations
+ * - Security headers
  *
  * @param ctx - Hono context
  * @param url - Destination URL
  * @param permanent - Whether this is a permanent (301) or temporary (302) redirect
+ * @param shortCode - The short code (for cache tags)
+ * @param latencyMs - Request latency for Server-Timing
+ * @param cacheHit - Whether the response came from cache
  * @returns Response object
  */
 function createRedirectResponse(
   ctx: Context,
   url: string,
-  permanent: boolean
+  permanent: boolean,
+  shortCode?: string,
+  latencyMs?: number,
+  cacheHit?: boolean
 ): Response {
   const statusCode = permanent ? 301 : 302;
   const cacheControl = permanent
     ? CACHE_CONTROL.REDIRECT_PERMANENT
     : CACHE_CONTROL.REDIRECT_TEMPORARY;
+  const surrogateControl = permanent
+    ? SURROGATE_CONTROL.REDIRECT_PERMANENT
+    : SURROGATE_CONTROL.REDIRECT_TEMPORARY;
+
+  // Build Server-Timing header for debugging
+  const serverTiming = buildServerTiming(latencyMs, cacheHit);
+
+  const headers: Record<string, string> = {
+    Location: url,
+    "Cache-Control": cacheControl,
+    // CDN-specific headers
+    "Surrogate-Control": surrogateControl,
+    // Vary on Accept-Encoding for compression
+    Vary: "Accept-Encoding",
+    // Security headers
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    // Timing header for debugging
+    "Server-Timing": serverTiming,
+  };
+
+  // Add cache tags for invalidation (if short code provided)
+  if (shortCode) {
+    const cacheTag = getCacheTag(shortCode);
+    // Fastly uses Surrogate-Key, Cloudflare uses Cache-Tag
+    headers["Surrogate-Key"] = cacheTag;
+    headers["Cache-Tag"] = cacheTag;
+  }
 
   return new Response(null, {
     status: statusCode,
-    headers: {
-      Location: url,
-      "Cache-Control": cacheControl,
-      // Security headers
-      "X-Content-Type-Options": "nosniff",
-      "X-Frame-Options": "DENY",
-      // Timing header for debugging
-      "Server-Timing": `redirect;desc="QuickLink"`,
-    },
+    headers,
   });
+}
+
+/**
+ * Build Server-Timing header for debugging.
+ *
+ * @see https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Server-Timing
+ */
+function buildServerTiming(latencyMs?: number, cacheHit?: boolean): string {
+  const parts: string[] = ["redirect;desc=\"QuickLink\""];
+
+  if (latencyMs !== undefined) {
+    parts.push(`total;dur=${latencyMs.toFixed(2)}`);
+  }
+
+  if (cacheHit !== undefined) {
+    parts.push(cacheHit ? "cache;desc=\"hit\"" : "cache;desc=\"miss\"");
+  }
+
+  return parts.join(", ");
 }
 
 /**
@@ -197,6 +295,7 @@ function createNotFoundResponse(ctx: Context): Response {
     headers: {
       "Content-Type": "text/plain; charset=utf-8",
       "Cache-Control": CACHE_CONTROL.NOT_FOUND,
+      "Surrogate-Control": SURROGATE_CONTROL.NOT_FOUND,
       "X-Content-Type-Options": "nosniff",
     },
   });
@@ -313,8 +412,8 @@ export async function handleRedirect(ctx: Context): Promise<Response> {
     console.warn(`[handler] Slow redirect: ${shortCode} took ${latencyMs.toFixed(2)}ms (cache=${cacheHit}, stale=${servedStale})`);
   }
 
-  // 10. REDIRECT
-  return createRedirectResponse(ctx, link.url, link.permanent);
+  // 10. REDIRECT with CDN-optimized headers
+  return createRedirectResponse(ctx, link.url, link.permanent, shortCode, latencyMs, cacheHit);
 }
 
 // =============================================================================

@@ -1,0 +1,25 @@
+; =============================================================================
+; PgBouncer User Authentication File
+; =============================================================================
+; Format: "username" "password"
+;
+; Password can be:
+; - Plain text (not recommended)
+; - MD5 hash: md5 + md5(password + username)
+; - SCRAM-SHA-256 hash
+;
+; To generate MD5 hash:
+;   echo -n "passwordusername" | md5sum
+;   Result: md5<hash>
+;
+; For production, use SCRAM-SHA-256 or external auth (LDAP, PAM)
+; =============================================================================
+
+; Application user (same as PostgreSQL user)
+"quicklink" "quicklink"
+
+; Admin user for PgBouncer console
+"quicklink_admin" "admin_secret_change_in_production"
+
+; Stats user (read-only stats access)
+"quicklink_stats" "stats_secret_change_in_production"

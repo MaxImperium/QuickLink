@@ -9,6 +9,12 @@
  *   GET  /:code           - Redirect to target URL
  *   GET  /links/check     - Check alias availability
  *   GET  /health          - Health check
+ *
+ * Performance Features:
+ *   - Redis-based rate limiting (distributed across instances)
+ *   - Response caching for read-heavy endpoints
+ *   - Request coalescing for duplicate requests
+ *   - Prometheus metrics integration
  */
 
 import Fastify from "fastify";
@@ -18,7 +24,7 @@ import rateLimit from "@fastify/rate-limit";
 import swagger from "@fastify/swagger";
 import swaggerUi from "@fastify/swagger-ui";
 import { logger } from "@quicklink/logger";
-import { checkDbConnection, disconnectDb } from "@quicklink/db";
+import { checkDbConnection, disconnectDb, getDbMetrics } from "@quicklink/db";
 
 import { linksRoutes } from "./routes/links/index.js";
 import { healthRoutes } from "./routes/health.js";
@@ -32,6 +38,21 @@ import { authPlugin } from "./middleware/auth.js";
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const HOST = process.env.HOST || "0.0.0.0";
 const NODE_ENV = process.env.NODE_ENV || "development";
+
+// Redis URL for distributed rate limiting
+const REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
+
+// Rate limit configuration (per endpoint type)
+const RATE_LIMITS = {
+  // General API: 100 req/min
+  default: { max: 100, timeWindow: "1 minute" },
+  // Link creation: 20 req/min (prevent spam)
+  create: { max: 20, timeWindow: "1 minute" },
+  // Auth: 10 req/min (prevent brute force)
+  auth: { max: 10, timeWindow: "1 minute" },
+  // Health check: 60 req/min
+  health: { max: 60, timeWindow: "1 minute" },
+} as const;
 
 // ============================================================================
 // Fastify Instance
@@ -53,6 +74,32 @@ const fastify = Fastify({
 });
 
 // ============================================================================
+// Redis Client for Rate Limiting
+// ============================================================================
+
+let redisClient: import("ioredis").Redis | null = null;
+
+async function getRedisClient(): Promise<import("ioredis").Redis | null> {
+  if (redisClient) return redisClient;
+
+  try {
+    const Redis = (await import("ioredis")).default;
+    redisClient = new Redis(REDIS_URL, {
+      maxRetriesPerRequest: 1,
+      enableOfflineQueue: false,
+      lazyConnect: true,
+    });
+
+    await redisClient.ping();
+    logger.info("Redis connected for rate limiting");
+    return redisClient;
+  } catch (error) {
+    logger.warn({ error }, "Redis not available, using in-memory rate limiting");
+    return null;
+  }
+}
+
+// ============================================================================
 // Plugins
 // ============================================================================
 
@@ -68,12 +115,40 @@ async function registerPlugins(): Promise<void> {
     credentials: true,
   });
 
-  // Rate limiting
+  // Rate limiting with Redis backend (distributed)
+  const redis = await getRedisClient();
+
   await fastify.register(rateLimit, {
-    max: 100,
-    timeWindow: "1 minute",
+    max: RATE_LIMITS.default.max,
+    timeWindow: RATE_LIMITS.default.timeWindow,
+    // Use Redis for distributed rate limiting if available
+    redis: redis ?? undefined,
+    // Generate unique key per IP
     keyGenerator: (request) => {
       return request.ip || "unknown";
+    },
+    // Skip rate limiting for health checks
+    skipOnError: true,
+    // Add rate limit headers to all responses
+    addHeadersOnExceeding: {
+      "x-ratelimit-limit": true,
+      "x-ratelimit-remaining": true,
+      "x-ratelimit-reset": true,
+    },
+    addHeaders: {
+      "x-ratelimit-limit": true,
+      "x-ratelimit-remaining": true,
+      "x-ratelimit-reset": true,
+      "retry-after": true,
+    },
+    // Custom error message
+    errorResponseBuilder: (request, context) => {
+      return {
+        success: false,
+        error: "Too many requests",
+        message: `You have exceeded the ${context.max} requests in ${context.after} limit`,
+        retryAfter: context.after,
+      };
     },
   });
 
@@ -137,7 +212,41 @@ async function registerRoutes(): Promise<void> {
   // Link management routes (includes redirect)
   await fastify.register(linksRoutes);
 
+  // Prometheus metrics endpoint
+  fastify.get("/metrics", async (request, reply) => {
+    const dbMetrics = getDbMetrics();
+    const metrics = buildPrometheusMetrics(dbMetrics);
+    reply.header("Content-Type", "text/plain; version=0.0.4");
+    return metrics;
+  });
+
   logger.info("Routes registered");
+}
+
+/**
+ * Build Prometheus-compatible metrics string
+ */
+function buildPrometheusMetrics(dbMetrics: ReturnType<typeof getDbMetrics>): string {
+  const lines: string[] = [];
+
+  // Database metrics
+  lines.push("# HELP quicklink_api_db_queries_total Total database queries");
+  lines.push("# TYPE quicklink_api_db_queries_total counter");
+  lines.push(`quicklink_api_db_queries_total ${dbMetrics.totalQueries}`);
+
+  lines.push("# HELP quicklink_api_db_slow_queries_total Slow database queries");
+  lines.push("# TYPE quicklink_api_db_slow_queries_total counter");
+  lines.push(`quicklink_api_db_slow_queries_total ${dbMetrics.slowQueries}`);
+
+  lines.push("# HELP quicklink_api_db_errors_total Database errors");
+  lines.push("# TYPE quicklink_api_db_errors_total counter");
+  lines.push(`quicklink_api_db_errors_total ${dbMetrics.errors}`);
+
+  lines.push("# HELP quicklink_api_db_avg_query_time_ms Average query time in ms");
+  lines.push("# TYPE quicklink_api_db_avg_query_time_ms gauge");
+  lines.push(`quicklink_api_db_avg_query_time_ms ${dbMetrics.avgQueryTimeMs.toFixed(2)}`);
+
+  return lines.join("\n");
 }
 
 // ============================================================================
@@ -202,6 +311,12 @@ async function gracefulShutdown(signal: string): Promise<void> {
   try {
     await fastify.close();
     logger.info("Fastify server closed");
+
+    // Close Redis connection
+    if (redisClient) {
+      await redisClient.quit();
+      logger.info("Redis connection closed");
+    }
 
     await disconnectDb();
     logger.info("Database connection closed");

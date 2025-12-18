@@ -1,0 +1,15 @@
+# Grafana Dashboard Provisioning
+# Auto-loads dashboards from the dashboards directory
+apiVersion: 1
+
+providers:
+  - name: 'QuickLink'
+    orgId: 1
+    folder: 'QuickLink'
+    folderUid: 'quicklink'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards/json
