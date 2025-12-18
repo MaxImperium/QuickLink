@@ -1,0 +1,39 @@
+{
+  "name": "@quicklink/api",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsup src/index.ts --format esm --dts",
+    "start": "node dist/index.js",
+    "lint": "eslint src/",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "clean": "rm -rf dist .turbo node_modules"
+  },
+  "dependencies": {
+    "@quicklink/cache": "workspace:*",
+    "@quicklink/db": "workspace:*",
+    "@quicklink/logger": "workspace:*",
+    "@quicklink/shared": "workspace:*",
+    "@quicklink/analytics": "workspace:*",
+    "@fastify/cors": "^8.4.0",
+    "@fastify/helmet": "^11.1.0",
+    "@fastify/rate-limit": "^9.0.0",
+    "@fastify/sensible": "^5.5.0",
+    "@fastify/swagger": "^8.12.0",
+    "@fastify/swagger-ui": "^2.0.0",
+    "fastify": "^4.24.0",
+    "zod": "^3.22.0"
+  },
+  "devDependencies": {
+    "@quicklink/config": "workspace:*",
+    "@types/node": "^20.10.0",
+    "tsup": "^8.0.0",
+    "tsx": "^4.6.0",
+    "typescript": "^5.3.0",
+    "vitest": "^1.0.0"
+  }
+}

@@ -1,0 +1,5 @@
+# Migrations Directory
+
+This folder will contain Prisma migration files.
+
+Run `pnpm db:migrate:dev` to create your first migration.

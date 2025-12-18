@@ -1,0 +1,2 @@
+// Placeholder: Shared constants
+export {};

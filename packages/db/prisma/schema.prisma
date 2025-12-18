@@ -1,0 +1,86 @@
+// =============================================================================
+// QuickLink Database Schema
+// =============================================================================
+// This is a placeholder schema. Implement actual tables based on requirements.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// -----------------------------------------------------------------------------
+// Users (Future: Authentication)
+// -----------------------------------------------------------------------------
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+  
+  links     Link[]
+  
+  @@map("users")
+}
+
+// -----------------------------------------------------------------------------
+// Links (Core Entity)
+// -----------------------------------------------------------------------------
+model Link {
+  id          String    @id @default(cuid())
+  shortCode   String    @unique @map("short_code")
+  originalUrl String    @map("original_url")
+  title       String?
+  
+  // Metadata
+  expiresAt   DateTime? @map("expires_at")
+  isActive    Boolean   @default(true) @map("is_active")
+  
+  // Soft delete
+  deletedAt   DateTime? @map("deleted_at")
+  
+  // Timestamps
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  
+  // Relations
+  userId      String?   @map("user_id")
+  user        User?     @relation(fields: [userId], references: [id])
+  clicks      Click[]
+  
+  @@index([shortCode])
+  @@index([userId])
+  @@map("links")
+}
+
+// -----------------------------------------------------------------------------
+// Clicks (Analytics Events)
+// -----------------------------------------------------------------------------
+model Click {
+  id        String   @id @default(cuid())
+  linkId    String   @map("link_id")
+  
+  // Click metadata
+  ipHash    String?  @map("ip_hash")  // Hashed for privacy
+  userAgent String?  @map("user_agent")
+  referer   String?
+  country   String?
+  city      String?
+  device    String?
+  browser   String?
+  os        String?
+  
+  // Timestamp
+  clickedAt DateTime @default(now()) @map("clicked_at")
+  
+  // Relations
+  link      Link     @relation(fields: [linkId], references: [id])
+  
+  @@index([linkId])
+  @@index([clickedAt])
+  @@map("clicks")
+}
