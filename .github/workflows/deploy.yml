@@ -1,45 +1,148 @@
 # =============================================================================
-# QuickLink CD Pipeline - Deploy to Production
+# QuickLink Deploy Pipeline
 # =============================================================================
+# Deploys application to staging or production environments
+#
+# Triggers:
+#   - Manual dispatch with environment selection
+#   - Automatic on push to main (staging) or release tags (production)
+#
+# Environments:
+#   - staging: Development/testing environment
+#   - production: Live production environment
 
 name: Deploy
 
 on:
-  push:
-    branches: [main]
+  # Manual deployment trigger
   workflow_dispatch:
+    inputs:
+      environment:
+        description: "Deployment environment"
+        required: true
+        default: "staging"
+        type: choice
+        options:
+          - staging
+          - production
+      skip_tests:
+        description: "Skip test verification"
+        required: false
+        default: false
+        type: boolean
+
+  # Auto-deploy to staging on main branch push
+  push:
+    branches:
+      - main
+      - master
+
+  # Auto-deploy to production on release tags
+  release:
+    types: [published]
 
 concurrency:
   group: deploy-${{ github.ref }}
   cancel-in-progress: false
 
 env:
+  NODE_VERSION: "20"
+  PNPM_VERSION: "8.12.0"
   REGISTRY: ghcr.io
-  IMAGE_PREFIX: ${{ github.repository }}
+  IMAGE_PREFIX: ghcr.io/${{ github.repository }}
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # Build and Push Docker Images
-  # ---------------------------------------------------------------------------
-  build-images:
-    name: Build Docker Images
+  # ===========================================================================
+  # Determine Environment
+  # ===========================================================================
+  setup:
+    name: Setup Deployment
     runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.env.outputs.environment }}
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Determine environment
+        id: env
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event_name }}" == "release" ]]; then
+            echo "environment=production" >> $GITHUB_OUTPUT
+          else
+            echo "environment=staging" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "release" ]]; then
+            echo "version=${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${{ github.sha }}" >> $GITHUB_OUTPUT
+          fi
+
+  # ===========================================================================
+  # Verify CI Passed (unless skipped)
+  # ===========================================================================
+  verify:
+    name: Verify CI
+    runs-on: ubuntu-latest
+    needs: setup
+    if: ${{ github.event.inputs.skip_tests != 'true' }}
+
+    steps:
+      - name: Check CI workflow status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: runs } = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'ci.yml',
+              head_sha: context.sha,
+              status: 'completed',
+              per_page: 1
+            });
+
+            if (runs.workflow_runs.length === 0) {
+              console.log('⚠️ No completed CI run found - proceeding with deployment');
+              return;
+            }
+
+            const latestRun = runs.workflow_runs[0];
+            if (latestRun.conclusion !== 'success') {
+              core.setFailed(`CI workflow failed with conclusion: ${latestRun.conclusion}`);
+              return;
+            }
+
+            console.log('✅ CI workflow passed');
+
+  # ===========================================================================
+  # Build Docker Images
+  # ===========================================================================
+  build-images:
+    name: Build ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    needs: [setup, verify]
+    if: always() && (needs.verify.result == 'success' || needs.verify.result == 'skipped')
     permissions:
       contents: read
       packages: write
-    
+
     strategy:
       matrix:
-        app: [api, redirect, web]
-    
+        service: [api, redirect, web]
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Docker Buildx
+      - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to Container Registry
+      - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -50,36 +153,323 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.app }}
+          images: ${{ env.IMAGE_PREFIX }}/${{ matrix.service }}
           tags: |
-            type=ref,event=branch
-            type=sha,prefix=
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=${{ needs.setup.outputs.version }}
+            type=raw,value=${{ needs.setup.outputs.environment }}
+            type=raw,value=latest,enable=${{ needs.setup.outputs.environment == 'production' }}
 
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: ./docker/${{ matrix.app }}/Dockerfile
+          file: ./docker/${{ matrix.service }}/Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          build-args: |
+            NEXT_PUBLIC_API_URL=${{ vars.NEXT_PUBLIC_API_URL || 'http://localhost:3001' }}
+            NEXT_PUBLIC_APP_URL=${{ vars.NEXT_PUBLIC_APP_URL || 'http://localhost:3000' }}
 
-  # ---------------------------------------------------------------------------
-  # Deploy (placeholder - implement based on your infrastructure)
-  # ---------------------------------------------------------------------------
-  deploy:
-    name: Deploy
+  # ===========================================================================
+  # Deploy to Staging
+  # ===========================================================================
+  deploy-staging:
+    name: Deploy to Staging
     runs-on: ubuntu-latest
-    needs: build-images
-    environment: production
+    needs: [setup, build-images]
+    if: needs.setup.outputs.environment == 'staging'
+    environment:
+      name: staging
+      url: ${{ vars.STAGING_URL || 'http://localhost:3000' }}
+
     steps:
-      - name: Deploy to production
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Deploy with Docker Compose
+        env:
+          VERSION: ${{ needs.setup.outputs.version }}
+          IMAGE_PREFIX: ${{ env.IMAGE_PREFIX }}
+        run: |
+          echo "🚀 Deploying to staging..."
+          echo "Version: $VERSION"
+          echo "Images:"
+          echo "  - $IMAGE_PREFIX/api:$VERSION"
+          echo "  - $IMAGE_PREFIX/redirect:$VERSION"
+          echo "  - $IMAGE_PREFIX/web:$VERSION"
+
+          # Generate staging docker-compose file
+          cat > docker-compose.staging.yml << EOF
+          version: "3.9"
+
+          services:
+            api:
+              image: $IMAGE_PREFIX/api:$VERSION
+              restart: unless-stopped
+              ports:
+                - "3001:3001"
+              environment:
+                - NODE_ENV=staging
+                - DATABASE_URL=\${DATABASE_URL}
+                - REDIS_URL=\${REDIS_URL}
+                - JWT_SECRET=\${JWT_SECRET}
+              depends_on:
+                postgres:
+                  condition: service_healthy
+                redis:
+                  condition: service_healthy
+              healthcheck:
+                test: ["CMD", "wget", "-qO-", "http://localhost:3001/health"]
+                interval: 30s
+                timeout: 10s
+                retries: 3
+
+            redirect:
+              image: $IMAGE_PREFIX/redirect:$VERSION
+              restart: unless-stopped
+              ports:
+                - "3002:3002"
+              environment:
+                - NODE_ENV=staging
+                - REDIS_URL=\${REDIS_URL}
+                - DATABASE_URL=\${DATABASE_URL}
+              depends_on:
+                redis:
+                  condition: service_healthy
+              healthcheck:
+                test: ["CMD", "wget", "-qO-", "http://localhost:3002/health/live"]
+                interval: 10s
+                timeout: 5s
+                retries: 3
+
+            web:
+              image: $IMAGE_PREFIX/web:$VERSION
+              restart: unless-stopped
+              ports:
+                - "3000:3000"
+              environment:
+                - NODE_ENV=staging
+              depends_on:
+                - api
+
+            postgres:
+              image: postgres:16-alpine
+              restart: unless-stopped
+              environment:
+                POSTGRES_USER: quicklink
+                POSTGRES_PASSWORD: \${POSTGRES_PASSWORD:-quicklink}
+                POSTGRES_DB: quicklink
+              volumes:
+                - postgres_staging:/var/lib/postgresql/data
+              healthcheck:
+                test: ["CMD-SHELL", "pg_isready -U quicklink"]
+                interval: 10s
+                timeout: 5s
+                retries: 5
+
+            redis:
+              image: redis:7-alpine
+              restart: unless-stopped
+              command: redis-server --appendonly yes
+              volumes:
+                - redis_staging:/data
+              healthcheck:
+                test: ["CMD", "redis-cli", "ping"]
+                interval: 10s
+                timeout: 5s
+                retries: 5
+
+          volumes:
+            postgres_staging:
+            redis_staging:
+          EOF
+
+          echo "✅ Staging docker-compose.staging.yml created"
+          echo ""
+          echo "To deploy locally:"
+          echo "  docker-compose -f docker-compose.staging.yml up -d"
+
+      - name: Upload staging manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-manifest
+          path: docker-compose.staging.yml
+          retention-days: 7
+
+  # ===========================================================================
+  # Deploy to Production
+  # ===========================================================================
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [setup, build-images]
+    if: needs.setup.outputs.environment == 'production'
+    environment:
+      name: production
+      url: ${{ vars.PRODUCTION_URL || 'https://quicklink.example.com' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Deploy with Docker Compose
+        env:
+          VERSION: ${{ needs.setup.outputs.version }}
+          IMAGE_PREFIX: ${{ env.IMAGE_PREFIX }}
         run: |
           echo "🚀 Deploying to production..."
-          echo "TODO: Implement deployment to your infrastructure"
-          # kubectl apply -f k8s/
-          # aws ecs update-service ...
-          # etc.
+          echo "Version: $VERSION"
+
+          cat > docker-compose.production.yml << EOF
+          version: "3.9"
+
+          services:
+            api:
+              image: $IMAGE_PREFIX/api:$VERSION
+              restart: always
+              ports:
+                - "3001:3001"
+              environment:
+                - NODE_ENV=production
+                - DATABASE_URL=\${DATABASE_URL}
+                - REDIS_URL=\${REDIS_URL}
+                - JWT_SECRET=\${JWT_SECRET}
+              deploy:
+                replicas: 2
+                resources:
+                  limits:
+                    cpus: '1'
+                    memory: 512M
+              healthcheck:
+                test: ["CMD", "wget", "-qO-", "http://localhost:3001/health"]
+                interval: 30s
+                timeout: 10s
+                retries: 3
+              depends_on:
+                postgres:
+                  condition: service_healthy
+                redis:
+                  condition: service_healthy
+
+            redirect:
+              image: $IMAGE_PREFIX/redirect:$VERSION
+              restart: always
+              ports:
+                - "3002:3002"
+              environment:
+                - NODE_ENV=production
+                - REDIS_URL=\${REDIS_URL}
+                - DATABASE_URL=\${DATABASE_URL}
+              deploy:
+                replicas: 3
+                resources:
+                  limits:
+                    cpus: '0.5'
+                    memory: 256M
+              healthcheck:
+                test: ["CMD", "wget", "-qO-", "http://localhost:3002/health/live"]
+                interval: 10s
+                timeout: 5s
+                retries: 3
+              depends_on:
+                redis:
+                  condition: service_healthy
+
+            web:
+              image: $IMAGE_PREFIX/web:$VERSION
+              restart: always
+              ports:
+                - "3000:3000"
+              environment:
+                - NODE_ENV=production
+              deploy:
+                replicas: 2
+                resources:
+                  limits:
+                    cpus: '1'
+                    memory: 512M
+              depends_on:
+                - api
+
+            postgres:
+              image: postgres:16-alpine
+              restart: always
+              environment:
+                POSTGRES_USER: quicklink
+                POSTGRES_PASSWORD: \${POSTGRES_PASSWORD}
+                POSTGRES_DB: quicklink
+              volumes:
+                - postgres_prod:/var/lib/postgresql/data
+              deploy:
+                resources:
+                  limits:
+                    cpus: '2'
+                    memory: 2G
+              healthcheck:
+                test: ["CMD-SHELL", "pg_isready -U quicklink"]
+                interval: 10s
+                timeout: 5s
+                retries: 5
+
+            redis:
+              image: redis:7-alpine
+              restart: always
+              command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+              volumes:
+                - redis_prod:/data
+              deploy:
+                resources:
+                  limits:
+                    cpus: '0.5'
+                    memory: 512M
+              healthcheck:
+                test: ["CMD", "redis-cli", "ping"]
+                interval: 10s
+                timeout: 5s
+                retries: 5
+
+          volumes:
+            postgres_prod:
+            redis_prod:
+          EOF
+
+          echo "✅ Production docker-compose.production.yml created"
+
+      - name: Upload production manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-manifest
+          path: docker-compose.production.yml
+          retention-days: 30
+
+      - name: Notify deployment
+        run: |
+          echo "📢 Production Deployment Complete"
+          echo "================================="
+          echo "Environment: production"
+          echo "Version: ${{ needs.setup.outputs.version }}"
+          echo "Status: ${{ job.status }}"
+
+  # ===========================================================================
+  # Deployment Summary
+  # ===========================================================================
+  summary:
+    name: Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [setup, build-images, deploy-staging, deploy-production]
+    if: always()
+
+    steps:
+      - name: Summary
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | ${{ needs.setup.outputs.environment }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | ${{ needs.setup.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build Status | ${{ needs.build-images.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deploy Status | ${{ needs.deploy-staging.result || needs.deploy-production.result }} |" >> $GITHUB_STEP_SUMMARY

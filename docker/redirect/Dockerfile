@@ -9,9 +9,13 @@ WORKDIR /app
 
 RUN corepack enable && corepack prepare pnpm@8.12.0 --activate
 
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+# Copy package files for dependency installation
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml turbo.json ./
 COPY apps/redirect/package.json ./apps/redirect/
-COPY packages/*/package.json ./packages/
+COPY packages/shared/package.json ./packages/shared/
+COPY packages/db/package.json ./packages/db/
+COPY packages/logger/package.json ./packages/logger/
+COPY packages/config/package.json ./packages/config/
 
 RUN pnpm install --frozen-lockfile
 
@@ -20,9 +24,17 @@ WORKDIR /app
 
 RUN corepack enable && corepack prepare pnpm@8.12.0 --activate
 
+# Copy node_modules from deps stage
 COPY --from=deps /app/node_modules ./node_modules
-COPY --from=deps /app/apps/redirect/node_modules ./apps/redirect/node_modules
-COPY . .
+COPY --from=deps /app/package.json ./package.json
+COPY --from=deps /app/pnpm-lock.yaml ./pnpm-lock.yaml
+COPY --from=deps /app/pnpm-workspace.yaml ./pnpm-workspace.yaml
+COPY --from=deps /app/turbo.json ./turbo.json
+
+# Copy source code
+COPY apps/redirect ./apps/redirect
+COPY packages ./packages
+COPY tsconfig.base.json ./
 
 RUN pnpm turbo run build --filter=@quicklink/redirect
 
@@ -34,8 +46,10 @@ ENV NODE_ENV=production
 RUN addgroup --system --gid 1001 nodejs
 RUN adduser --system --uid 1001 quicklink
 
+# Copy built application and dependencies
 COPY --from=builder --chown=quicklink:nodejs /app/apps/redirect/dist ./dist
 COPY --from=builder --chown=quicklink:nodejs /app/apps/redirect/package.json ./
+COPY --from=builder --chown=quicklink:nodejs /app/node_modules ./node_modules
 
 USER quicklink
 

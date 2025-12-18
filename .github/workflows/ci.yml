@@ -1,88 +1,118 @@
 # =============================================================================
 # QuickLink CI Pipeline
 # =============================================================================
+# Runs on every push and pull request to main/master branches
+#
+# Jobs:
+#   1. Lint - ESLint + Prettier checks
+#   2. Build - TypeScript compilation
+#   3. Test - Unit, integration, and E2E tests with coverage
+#   4. Docker - Build Docker images (on main branch only)
 
 name: CI
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main, master, develop]
   pull_request:
-    branches: [main, develop]
+    branches: [main, master, develop]
+
+env:
+  NODE_VERSION: "20"
+  PNPM_VERSION: "8.12.0"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # Lint & Type Check
-  # ---------------------------------------------------------------------------
+  # ===========================================================================
+  # Lint Job - Check code style and formatting
+  # ===========================================================================
   lint:
-    name: Lint & Type Check
+    name: Lint & Format
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v2
         with:
-          version: 8
+          version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: 'pnpm'
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "pnpm"
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Lint
+      - name: Run Prettier check
+        run: pnpm format:check
+
+      - name: Run ESLint
         run: pnpm lint
 
-      - name: Type check
-        run: pnpm typecheck
-
-  # ---------------------------------------------------------------------------
-  # Build
-  # ---------------------------------------------------------------------------
+  # ===========================================================================
+  # Build Job - TypeScript compilation and type checking
+  # ===========================================================================
   build:
     name: Build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: lint
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v2
         with:
-          version: 8
+          version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: 'pnpm'
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "pnpm"
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
       - name: Generate Prisma Client
-        run: pnpm --filter @quicklink/db db:generate
+        run: pnpm db:generate
 
-      - name: Build
+      - name: Run TypeScript type checking
+        run: pnpm typecheck
+
+      - name: Build all packages
         run: pnpm build
 
-  # ---------------------------------------------------------------------------
-  # Test
-  # ---------------------------------------------------------------------------
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: |
+            apps/*/dist
+            packages/*/dist
+            apps/web/.next
+          retention-days: 1
+
+  # ===========================================================================
+  # Test Job - Run all tests with coverage
+  # ===========================================================================
   test:
     name: Test
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: lint
+
     services:
       postgres:
         image: postgres:16-alpine
@@ -111,30 +141,127 @@ jobs:
     env:
       DATABASE_URL: postgresql://quicklink:quicklink@localhost:5432/quicklink_test
       REDIS_URL: redis://localhost:6379
+      JWT_SECRET: test-jwt-secret-for-ci-pipeline
+      NODE_ENV: test
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v2
         with:
-          version: 8
+          version: ${{ env.PNPM_VERSION }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: 'pnpm'
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "pnpm"
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
       - name: Generate Prisma Client
-        run: pnpm --filter @quicklink/db db:generate
+        run: pnpm db:generate
 
-      - name: Run migrations
-        run: pnpm --filter @quicklink/db db:migrate
+      - name: Run database migrations
+        run: pnpm db:migrate
 
-      - name: Run tests
+      - name: Run tests with coverage
         run: pnpm test:ci
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage/lcov.info,./packages/*/coverage/lcov.info,./apps/*/coverage/lcov.info
+          flags: unittests
+          name: quicklink-coverage
+          fail_ci_if_error: false
+          verbose: true
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-reports
+          path: |
+            coverage/
+            packages/*/coverage/
+            apps/*/coverage/
+          retention-days: 7
+
+  # ===========================================================================
+  # Docker Build Job - Build and push Docker images
+  # ===========================================================================
+  docker:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [lint, build, test]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+
+    strategy:
+      matrix:
+        service: [api, redirect, web]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}/${{ matrix.service }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/${{ matrix.service }}/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            NEXT_PUBLIC_API_URL=${{ vars.NEXT_PUBLIC_API_URL || 'http://localhost:3001' }}
+            NEXT_PUBLIC_APP_URL=${{ vars.NEXT_PUBLIC_APP_URL || 'http://localhost:3000' }}
+
+  # ===========================================================================
+  # Summary Job - Final status check
+  # ===========================================================================
+  ci-success:
+    name: CI Success
+    runs-on: ubuntu-latest
+    needs: [lint, build, test]
+    if: always()
+
+    steps:
+      - name: Check all jobs passed
+        run: |
+          if [[ "${{ needs.lint.result }}" != "success" ]] || \
+             [[ "${{ needs.build.result }}" != "success" ]] || \
+             [[ "${{ needs.test.result }}" != "success" ]]; then
+            echo "❌ CI failed!"
+            echo "Lint: ${{ needs.lint.result }}"
+            echo "Build: ${{ needs.build.result }}"
+            echo "Test: ${{ needs.test.result }}"
+            exit 1
+          fi
+          echo "✅ All CI jobs passed!"

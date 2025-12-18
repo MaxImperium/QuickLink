@@ -9,9 +9,11 @@ WORKDIR /app
 
 RUN corepack enable && corepack prepare pnpm@8.12.0 --activate
 
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+# Copy package files for dependency installation
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml turbo.json ./
 COPY apps/web/package.json ./apps/web/
-COPY packages/*/package.json ./packages/
+COPY packages/shared/package.json ./packages/shared/
+COPY packages/config/package.json ./packages/config/
 
 RUN pnpm install --frozen-lockfile
 
@@ -20,9 +22,17 @@ WORKDIR /app
 
 RUN corepack enable && corepack prepare pnpm@8.12.0 --activate
 
+# Copy node_modules from deps stage
 COPY --from=deps /app/node_modules ./node_modules
-COPY --from=deps /app/apps/web/node_modules ./apps/web/node_modules
-COPY . .
+COPY --from=deps /app/package.json ./package.json
+COPY --from=deps /app/pnpm-lock.yaml ./pnpm-lock.yaml
+COPY --from=deps /app/pnpm-workspace.yaml ./pnpm-workspace.yaml
+COPY --from=deps /app/turbo.json ./turbo.json
+
+# Copy source code
+COPY apps/web ./apps/web
+COPY packages ./packages
+COPY tsconfig.base.json ./
 
 # Build arguments for Next.js
 ARG NEXT_PUBLIC_API_URL
