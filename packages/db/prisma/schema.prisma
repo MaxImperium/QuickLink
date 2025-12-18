@@ -40,14 +40,15 @@ enum LinkLifecycleState {
 }
 
 // =============================================================================
-// USERS (Future: Authentication)
+// USERS (Authentication)
 // =============================================================================
 
 /// User accounts for link ownership and authentication
 model User {
-  id        BigInt   @id @default(autoincrement())
-  email     String   @unique @db.VarChar(255)
-  name      String?  @db.VarChar(100)
+  id             BigInt   @id @default(autoincrement())
+  email          String   @unique @db.VarChar(255)
+  hashedPassword String   @map("hashed_password") @db.VarChar(255)
+  name           String?  @db.VarChar(100)
   
   // Timestamps
   createdAt DateTime @default(now()) @map("created_at")
@@ -56,6 +57,8 @@ model User {
   // Relations
   links     Link[]
   
+  // Indexes
+  @@index([email])
   @@map("users")
 }
 

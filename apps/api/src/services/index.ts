@@ -14,6 +14,9 @@ import {
 } from "@quicklink/shared";
 import { logger } from "@quicklink/logger";
 
+// Re-export auth service
+export * from "./auth.js";
+
 // ============================================================================
 // Types
 // ============================================================================

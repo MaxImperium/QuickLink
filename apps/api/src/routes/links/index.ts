@@ -10,6 +10,7 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import { z } from "zod";
 import { createLink, getLinkByCode, checkAliasAvailability, recordClick } from "../../services/index.js";
+import { requireAuth, optionalAuth } from "../../middleware/auth.js";
 import { logger } from "@quicklink/logger";
 import { createHash } from "node:crypto";
 
@@ -65,8 +66,8 @@ async function createLinkHandler(
 
   const { targetUrl, customAlias, expiresAt, maxClicks } = parseResult.data;
 
-  // Get user ID from auth (placeholder - implement with actual auth)
-  const userId = (request as unknown as { userId?: string }).userId || null;
+  // Get user ID from authenticated request (set by auth middleware)
+  const userId = request.userId || null;
 
   const result = await createLink({
     targetUrl,
@@ -188,11 +189,13 @@ async function checkAliasHandler(
 // ============================================================================
 
 export async function linksRoutes(fastify: FastifyInstance): Promise<void> {
-  // POST /links - Create new short link
+  // POST /links - Create new short link (optional auth - anonymous or authenticated)
   fastify.post("/links", {
+    preHandler: optionalAuth,
     schema: {
       description: "Create a new shortened URL",
       tags: ["links"],
+      security: [{ bearerAuth: [] }, {}],
       body: {
         type: "object",
         required: ["targetUrl"],

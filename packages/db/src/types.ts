@@ -30,6 +30,16 @@ export enum LinkLifecycleState {
 export interface User {
   id: bigint;
   email: string;
+  hashedPassword: string;
+  name: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+/** User without sensitive fields (for API responses) */
+export interface SafeUser {
+  id: bigint;
+  email: string;
   name: string | null;
   createdAt: Date;
   updatedAt: Date;
@@ -37,12 +47,47 @@ export interface User {
 
 export interface CreateUserInput {
   email: string;
+  hashedPassword: string;
   name?: string;
 }
 
 export interface UpdateUserInput {
   email?: string;
+  hashedPassword?: string;
   name?: string | null;
+}
+
+// =============================================================================
+// AUTH TYPES
+// =============================================================================
+
+/** JWT payload stored in token */
+export interface AuthPayload {
+  userId: string;
+  email: string;
+  iat?: number;
+  exp?: number;
+}
+
+/** Login credentials */
+export interface LoginInput {
+  email: string;
+  password: string;
+}
+
+/** Registration input */
+export interface RegisterInput {
+  email: string;
+  password: string;
+  name?: string;
+}
+
+/** Auth response with token */
+export interface AuthResponse {
+  success: boolean;
+  token?: string;
+  user?: SafeUser;
+  error?: string;
 }
 
 // =============================================================================

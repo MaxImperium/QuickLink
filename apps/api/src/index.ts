@@ -22,6 +22,8 @@ import { checkDbConnection, disconnectDb } from "@quicklink/db";
 
 import { linksRoutes } from "./routes/links/index.js";
 import { healthRoutes } from "./routes/health.js";
+import { authRoutes } from "./routes/auth/index.js";
+import { authPlugin } from "./middleware/auth.js";
 
 // ============================================================================
 // Configuration
@@ -90,10 +92,20 @@ async function registerPlugins(): Promise<void> {
         },
       ],
       tags: [
+        { name: "auth", description: "Authentication endpoints" },
         { name: "links", description: "Link management endpoints" },
         { name: "redirect", description: "URL redirection" },
         { name: "health", description: "Health check endpoints" },
       ],
+      components: {
+        securitySchemes: {
+          bearerAuth: {
+            type: "http",
+            scheme: "bearer",
+            bearerFormat: "JWT",
+          },
+        },
+      },
     },
   });
 
@@ -113,8 +125,14 @@ async function registerPlugins(): Promise<void> {
 // ============================================================================
 
 async function registerRoutes(): Promise<void> {
+  // Auth plugin (decorates request with auth properties)
+  await fastify.register(authPlugin);
+
   // Health check routes
   await fastify.register(healthRoutes);
+
+  // Auth routes (register, login, me)
+  await fastify.register(authRoutes);
 
   // Link management routes (includes redirect)
   await fastify.register(linksRoutes);
