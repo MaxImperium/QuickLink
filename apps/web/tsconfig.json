@@ -3,6 +3,7 @@
   "compilerOptions": {
     "target": "ES2017",
     "lib": ["DOM", "DOM.Iterable", "ES2017"],
+    "types": ["node"],
     "module": "ESNext",
     "moduleResolution": "bundler",
     "jsx": "preserve",
