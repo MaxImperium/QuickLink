@@ -54,6 +54,9 @@ function optionalInt(name: string, defaultValue: number): number {
  */
 export function loadConfig(): Config {
   return {
+    // Environment
+    env: parseEnv(optional("NODE_ENV", "development")),
+
     // Server
     port: optionalInt("PORT", 3002),
     host: optional("HOST", "0.0.0.0"),
@@ -73,6 +76,17 @@ export function loadConfig(): Config {
     // Logging
     logLevel: parseLogLevel(optional("LOG_LEVEL", "warn")),
   };
+}
+
+/**
+ * Parse environment string to enum.
+ */
+function parseEnv(env: string): Config["env"] {
+  const normalized = env.toLowerCase();
+  if (["development", "staging", "production"].includes(normalized)) {
+    return normalized as Config["env"];
+  }
+  return "development";
 }
 
 /**

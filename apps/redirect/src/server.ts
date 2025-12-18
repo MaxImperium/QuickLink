@@ -1,5 +1,5 @@
 /**
- * HTTP Server Bootstrap
+ * HTTP Server Bootstrap - Production Optimized
  *
  * Minimal Hono server setup for the redirect service.
  *
@@ -9,6 +9,11 @@
  * - Built-in TypeScript
  * - Simple, predictable behavior
  * - Easy to understand and debug
+ *
+ * Performance Targets:
+ * - P99 latency: <50ms
+ * - Cache hit rate: >95%
+ * - Throughput: 10,000+ req/s per instance
  *
  * Trade-offs:
  * - Less ecosystem than Express/Fastify
@@ -82,32 +87,72 @@ function createApp(): Hono {
 }
 
 // =============================================================================
-// Analytics Emitter (Placeholder)
+// Analytics Emitter
 // =============================================================================
 
 /**
- * Create analytics emitter.
+ * Analytics producer instance.
+ * Initialized in setupAnalytics() - may be null if analytics is disabled.
+ */
+let analyticsProducer: { emitClickEvent: (event: ClickEvent) => void; shutdown: () => Promise<void> } | null = null;
+
+/**
+ * Set up analytics integration.
  *
- * In production, this would push to Redis queue (BullMQ).
- * For now, it's a placeholder that logs events.
+ * Attempts to use @quicklink/analytics package for production.
+ * Falls back to logging in development or if package unavailable.
  *
  * Design: Fire-and-forget - never blocks the redirect.
+ *
+ * @param config - Application configuration
  */
-function createAnalyticsEmitter(config: Config): (event: ClickEvent) => void {
-  // TODO: Replace with actual queue implementation
-  // Example with BullMQ:
-  // const queue = new Queue('analytics', { connection: redisConnection });
-  // return (event) => queue.add('click', event, { removeOnComplete: true });
+async function setupAnalytics(config: Config): Promise<void> {
+  try {
+    // Try to import the analytics package
+    const analytics = await import("@quicklink/analytics");
 
-  // Placeholder: Just log in debug mode
-  if (config.logLevel === "debug") {
-    return (event: ClickEvent) => {
-      console.debug("[analytics] Click event:", event.code);
-    };
+    // Initialize the producer with Redis connection
+    analyticsProducer = await analytics.createProducer({
+      redis: {
+        url: config.redisUrl,
+        maxRetriesPerRequest: 1,
+      },
+      queueName: "analytics",
+    });
+
+    // Wire up the emitter to the handler
+    setAnalyticsEmitter((event: ClickEvent) => {
+      // Fire-and-forget: no await, no error handling
+      // Producer handles queuing internally
+      analyticsProducer?.emitClickEvent(event);
+    });
+
+    console.log("[server] Analytics producer initialized");
+  } catch (err) {
+    // Analytics package not available or failed to init
+    // This is OK - we can still serve redirects
+    console.warn("[server] Analytics not available, using placeholder:", (err as Error).message);
+
+    // Fallback: Log in debug mode, no-op in production
+    if (config.logLevel === "debug") {
+      setAnalyticsEmitter((event: ClickEvent) => {
+        console.debug("[analytics] Click event:", event.code);
+      });
+    } else {
+      // No-op emitter - silently discard events
+      setAnalyticsEmitter(() => {});
+    }
   }
+}
 
-  // No-op in production (until queue is implemented)
-  return () => {};
+/**
+ * Shutdown analytics producer.
+ */
+async function shutdownAnalytics(): Promise<void> {
+  if (analyticsProducer) {
+    await analyticsProducer.shutdown();
+    analyticsProducer = null;
+  }
 }
 
 // =============================================================================
@@ -119,35 +164,45 @@ function createAnalyticsEmitter(config: Config): (event: ClickEvent) => void {
  */
 async function initialize(config: Config): Promise<void> {
   console.log("[server] Initializing...");
+  console.log(`[server] Environment: ${config.env}`);
 
-  // Initialize cache (Redis)
+  // Initialize cache (Redis) - non-blocking
   initCache({
     redisUrl: config.redisUrl,
     redisTimeoutMs: config.redisTimeoutMs,
     cacheTtlSeconds: config.cacheTtlSeconds,
     notFoundTtlSeconds: config.notFoundTtlSeconds,
   });
+  console.log("[server] Cache module initialized");
 
-  // Initialize database
+  // Initialize database - verify connection
   await initDb({
     databaseUrl: config.databaseUrl,
     dbTimeoutMs: config.dbTimeoutMs,
   });
+  console.log("[server] Database connection established");
 
-  // Initialize analytics emitter
-  const emitter = createAnalyticsEmitter(config);
-  setAnalyticsEmitter(emitter);
+  // Initialize analytics emitter (may fail gracefully)
+  await setupAnalytics(config);
 
   console.log("[server] Initialization complete");
 }
 
 /**
  * Graceful shutdown handler.
+ * Ensures all pending operations complete before exit.
  */
 async function shutdown(): Promise<void> {
   console.log("[server] Shutting down...");
 
-  await Promise.all([shutdownCache(), shutdownDb()]);
+  // Shutdown in reverse order of initialization
+  const shutdownPromises = [
+    shutdownAnalytics().catch((err) => console.error("[server] Analytics shutdown error:", err)),
+    shutdownCache().catch((err) => console.error("[server] Cache shutdown error:", err)),
+    shutdownDb().catch((err) => console.error("[server] DB shutdown error:", err)),
+  ];
+
+  await Promise.all(shutdownPromises);
 
   console.log("[server] Shutdown complete");
   process.exit(0);

@@ -1,5 +1,5 @@
 /**
- * Database Fallback Interface
+ * Database Fallback Interface - Performance Optimized
  *
  * Raw SQL queries for URL lookup when cache misses.
  * Uses `pg` directly - NO ORM, NO query builder.
@@ -9,9 +9,19 @@
  * - Connection pool (pg.Pool) for connection reuse
  * - Prepared statements for query plan caching
  * - Read-only operations - this service never writes to DB
+ *
+ * Performance Characteristics:
+ * - Cold query: ~10-30ms (network + parsing)
+ * - Warm query: ~5-15ms (cached plan)
+ * - Connection acquisition: ~1-2ms (pooled)
+ *
+ * Graceful Degradation:
+ * - Returns null on any error (cache or stale serve)
+ * - Logs errors for debugging but never throws
  */
 
 import type { CachedLink, Config } from "./types.js";
+import * as metrics from "./metrics.js";
 
 // =============================================================================
 // Types
@@ -128,7 +138,12 @@ export async function initDb(
  * @returns CachedLink format if found, null if not found or error
  */
 export async function lookup(shortCode: string): Promise<CachedLink | null> {
-  if (!pool) return null;
+  if (!pool) {
+    metrics.increment("db_error");
+    return null;
+  }
+
+  const start = performance.now();
 
   try {
     const result = await withTimeout(
@@ -136,11 +151,18 @@ export async function lookup(shortCode: string): Promise<CachedLink | null> {
       config.dbTimeoutMs
     );
 
+    const latency = performance.now() - start;
+
     if (!result || result.rows.length === 0) {
       return null;
     }
 
     const row = result.rows[0];
+
+    // Log slow queries for investigation
+    if (latency > 30) {
+      console.warn(`[db] Slow query: ${shortCode} took ${latency.toFixed(2)}ms`);
+    }
 
     // Convert to CachedLink format for cache storage
     return {
@@ -149,7 +171,17 @@ export async function lookup(shortCode: string): Promise<CachedLink | null> {
       cachedAt: Date.now(),
     };
   } catch (err) {
-    console.error("[db] Lookup error:", err);
+    const latency = performance.now() - start;
+
+    // Distinguish timeout from other errors
+    if (latency >= config.dbTimeoutMs - 10) {
+      console.error(`[db] Query timeout: ${shortCode} after ${latency.toFixed(2)}ms`);
+      metrics.increment("db_timeout");
+    } else {
+      console.error("[db] Lookup error:", err);
+      metrics.increment("db_error");
+    }
+
     return null;
   }
 }

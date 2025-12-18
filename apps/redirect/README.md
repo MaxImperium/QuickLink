@@ -6,16 +6,17 @@ Ultra-low-latency HTTP redirect service for the QuickLink platform.
 
 ## ⚡ Performance First
 
-This service has ONE job: **redirect fast**. Every architectural decision optimizes for minimal latency.
+This service has ONE job: **redirect fast**. Every architectural decision optimizes for <50ms latency.
 
 **Target Metrics:**
 | Metric | Target | Rationale |
 |--------|--------|-----------|
 | p50 latency | < 5ms | Cache hit path |
-| p99 latency | < 20ms | DB fallback path |
+| p99 latency | < 50ms | DB fallback path (hard requirement) |
 | Startup time | < 500ms | Fast container scaling |
 | Memory | < 50MB | Cheap horizontal scaling |
 | Throughput | > 10k req/s | Per instance baseline |
+| Cache hit rate | > 95% | Minimize DB load |
 
 ---
 
@@ -42,11 +43,19 @@ This service has ONE job: **redirect fast**. Every architectural decision optimi
                     │       │                                        │
                     │       ▼ (fire-and-forget)                     │
                     │  ┌─────────────┐                              │
-                    │  │  Analytics  │──▶ Redis Queue               │
+                    │  │  Analytics  │──▶ Redis Queue (BullMQ)      │
                     │  │    Event    │                              │
                     │  └─────────────┘                              │
                     └─────────────────────────────────────────────────┘
 ```
+
+### Key Optimizations
+
+1. **Versioned Cache Keys**: `ql:v1:link:{code}` enables rolling deploys
+2. **TTL Jitter**: ±8% prevents thundering herd on mass expiration
+3. **Negative Caching**: `ql:v1:404:{code}` blocks brute-force scanning
+4. **CDN-Compatible Headers**: Proper Cache-Control for edge caching
+5. **Graceful Degradation**: Redis down → DB, DB down → stale cache → 503
 
 ---
 
@@ -71,33 +80,40 @@ These constraints are **non-negotiable** for latency reasons:
 async function handleRedirect(shortCode: string): Promise<Response> {
   const start = performance.now();
   
-  // 1. CACHE LOOKUP (Redis) - Expected: 0.5-2ms
-  let url = await cache.get(shortCode);
+  // 1. VALIDATE (fast rejection) - ~0.01ms
+  if (!isValidShortCode(shortCode)) return notFound();
   
-  // 2. DB FALLBACK - Only on cache miss - Expected: 5-15ms
-  if (!url) {
-    url = await db.lookup(shortCode);
+  // 2. NEGATIVE CACHE CHECK (known 404s) - ~0.5-2ms
+  if (await cache.isNotFound(shortCode)) return notFound();
+  
+  // 3. CACHE LOOKUP (Redis) - ~0.5-2ms
+  let link = await cache.get(shortCode);
+  
+  // 4. DB FALLBACK - Only on cache miss - ~10-30ms
+  if (!link) {
+    link = await db.lookup(shortCode);
     
-    if (url) {
-      // 3. WARM CACHE - Async, don't await
-      cache.set(shortCode, url).catch(ignoreError);
+    if (link) {
+      // WARM CACHE - Async, don't await
+      cache.set(shortCode, link).catch(ignoreError);
+    } else {
+      // CACHE 404 - Prevent repeated DB lookups
+      cache.setNotFound(shortCode).catch(ignoreError);
     }
   }
   
-  // 4. NOT FOUND
-  if (!url) {
-    metrics.increment('redirect.notfound');
-    return new Response(null, { status: 404 });
-  }
+  // 5. NOT FOUND
+  if (!link) return notFound();
   
-  // 5. EMIT ANALYTICS - Fire-and-forget, never await
-  analytics.emit({ shortCode, timestamp: Date.now() }).catch(ignoreError);
+  // 6. EMIT ANALYTICS - Fire-and-forget, never await
+  analytics.emitClickEvent({ code: shortCode, ts: Date.now() });
   
-  // 6. RECORD LATENCY
-  metrics.recordLatency('redirect', performance.now() - start);
+  // 7. RECORD LATENCY
+  metrics.recordRedirect(link.permanent ? 301 : 302, cacheHit, latency);
   
-  // 7. REDIRECT (301 for SEO, 302 for temporary)
-  return Response.redirect(url, 301);
+  // 8. REDIRECT (301 permanent, 302 temporary)
+  return redirect(link.url, link.permanent ? 301 : 302);
+}
 }
 ```
 

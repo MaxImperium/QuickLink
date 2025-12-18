@@ -13,17 +13,23 @@
     "lint": "eslint src/",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "worker": "tsx src/worker-entrypoint.ts",
+    "aggregator": "tsx src/aggregator-entrypoint.ts",
     "clean": "rm -rf dist .turbo node_modules"
   },
   "dependencies": {
     "@quicklink/db": "workspace:*",
     "@quicklink/logger": "workspace:*",
     "@quicklink/shared": "workspace:*",
-    "bullmq": "^5.0.0"
+    "@prisma/client": "^5.7.0",
+    "bullmq": "^5.0.0",
+    "ioredis": "^5.3.0"
   },
   "devDependencies": {
     "@quicklink/config": "workspace:*",
+    "@types/node": "^20.10.0",
     "tsup": "^8.0.0",
+    "tsx": "^4.6.0",
     "typescript": "^5.3.0",
     "vitest": "^1.0.0"
   }
