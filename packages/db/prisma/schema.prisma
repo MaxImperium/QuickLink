@@ -1,7 +1,21 @@
 // =============================================================================
 // QuickLink Database Schema
 // =============================================================================
-// This is a placeholder schema. Implement actual tables based on requirements.
+//
+// Production-ready PostgreSQL schema for URL shortener with:
+// - Short link creation and lifecycle management
+// - Click event tracking for analytics
+// - Reserved aliases for blocklist
+// - Aggregated statistics for dashboards
+//
+// Design Decisions:
+// - bigint IDs for high volume (vs UUID for distribution)
+// - Separate click_events and aggregated_stats tables
+// - Soft delete via deleted_at timestamp
+// - Composite indexes for hot query paths
+//
+// @see packages/shared/SHORTCODE_DESIGN.md for short code generation
+// =============================================================================
 
 generator client {
   provider = "prisma-client-js"
@@ -12,75 +26,250 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// -----------------------------------------------------------------------------
-// Users (Future: Authentication)
-// -----------------------------------------------------------------------------
+// =============================================================================
+// ENUMS
+// =============================================================================
+
+/// Link lifecycle states for managing link availability
+enum LinkLifecycleState {
+  active    // Link is active and accepting redirects
+  expired   // Link has passed its expiration date
+  disabled  // Link manually disabled by owner/admin
+
+  @@map("link_lifecycle_state")
+}
+
+// =============================================================================
+// USERS (Future: Authentication)
+// =============================================================================
+
+/// User accounts for link ownership and authentication
 model User {
-  id        String   @id @default(cuid())
-  email     String   @unique
-  name      String?
+  id        BigInt   @id @default(autoincrement())
+  email     String   @unique @db.VarChar(255)
+  name      String?  @db.VarChar(100)
+  
+  // Timestamps
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
   
+  // Relations
   links     Link[]
   
   @@map("users")
 }
 
-// -----------------------------------------------------------------------------
-// Links (Core Entity)
-// -----------------------------------------------------------------------------
+// =============================================================================
+// LINKS (Core Entity)
+// =============================================================================
+
+/// Core link entity - the main table for URL shortening
+/// 
+/// Performance Notes:
+/// - short_code index is the hot path (every redirect hits this)
+/// - user_id index for user dashboard queries
+/// - deleted_at allows soft delete without removing data
 model Link {
-  id          String    @id @default(cuid())
-  shortCode   String    @unique @map("short_code")
-  originalUrl String    @map("original_url")
-  title       String?
+  id              BigInt              @id @default(autoincrement())
   
-  // Metadata
-  expiresAt   DateTime? @map("expires_at")
-  isActive    Boolean   @default(true) @map("is_active")
+  /// Unique short code (e.g., "aB3xY9k")
+  /// Max 10 chars to allow for future length increases
+  shortCode       String              @unique @map("short_code") @db.VarChar(10)
   
-  // Soft delete
-  deletedAt   DateTime? @map("deleted_at")
+  /// Target URL to redirect to
+  targetUrl       String              @map("target_url") @db.Text
+  
+  /// Optional title for display in dashboards
+  title           String?             @db.VarChar(255)
+  
+  // Lifecycle Management
+  /// Whether this link accepts redirects
+  active          Boolean             @default(true)
+  
+  /// Whether this is a user-provided custom alias (vs auto-generated)
+  customAlias     Boolean             @default(false) @map("custom_alias")
+  
+  /// Link lifecycle state machine
+  lifecycleState  LinkLifecycleState  @default(active) @map("lifecycle_state")
+  
+  /// When the link expires (null = never)
+  expiresAt       DateTime?           @map("expires_at")
+  
+  // Soft Delete
+  /// Null = not deleted, timestamp = when deleted
+  deletedAt       DateTime?           @map("deleted_at")
   
   // Timestamps
-  createdAt   DateTime  @default(now()) @map("created_at")
-  updatedAt   DateTime  @updatedAt @map("updated_at")
+  createdAt       DateTime            @default(now()) @map("created_at")
+  updatedAt       DateTime            @updatedAt @map("updated_at")
   
   // Relations
-  userId      String?   @map("user_id")
-  user        User?     @relation(fields: [userId], references: [id])
-  clicks      Click[]
+  userId          BigInt?             @map("user_id")
+  user            User?               @relation(fields: [userId], references: [id], onDelete: SetNull)
   
-  @@index([shortCode])
-  @@index([userId])
+  clickEvents     ClickEvent[]
+  aggregatedStats AggregatedStat[]
+  
+  // Indexes
+  /// Primary lookup index - every redirect query uses this
+  @@index([shortCode], name: "idx_links_short_code")
+  
+  /// User dashboard queries
+  @@index([userId], name: "idx_links_user_id")
+  
+  /// Filtering active links
+  @@index([active, lifecycleState], name: "idx_links_active_state")
+  
+  /// Soft delete filtering
+  @@index([deletedAt], name: "idx_links_deleted_at")
+  
   @@map("links")
 }
 
-// -----------------------------------------------------------------------------
-// Clicks (Analytics Events)
-// -----------------------------------------------------------------------------
-model Click {
-  id        String   @id @default(cuid())
-  linkId    String   @map("link_id")
+// =============================================================================
+// CLICK EVENTS (Analytics - High Volume)
+// =============================================================================
+
+/// Individual click events for detailed analytics
+/// 
+/// Volume Considerations:
+/// - Expect tens of millions of rows
+/// - Partitioning by created_at recommended at scale
+/// - Consider archival strategy for old events
+/// 
+/// Privacy Notes:
+/// - ip_address stored for geo lookup, consider hashing in production
+/// - user_agent for device/browser analytics
+model ClickEvent {
+  id        BigInt   @id @default(autoincrement())
   
-  // Click metadata
-  ipHash    String?  @map("ip_hash")  // Hashed for privacy
-  userAgent String?  @map("user_agent")
-  referer   String?
-  country   String?
-  city      String?
-  device    String?
-  browser   String?
-  os        String?
+  /// Reference to the clicked link
+  linkId    BigInt   @map("link_id")
   
-  // Timestamp
-  clickedAt DateTime @default(now()) @map("clicked_at")
+  /// When the click occurred
+  createdAt DateTime @default(now()) @map("created_at")
+  
+  /// Client IP (IPv4 or IPv6, max 45 chars)
+  /// Consider hashing for GDPR compliance
+  ipAddress String?  @map("ip_address") @db.VarChar(45)
+  
+  /// Full user agent string for device/browser detection
+  userAgent String?  @map("user_agent") @db.Text
+  
+  /// HTTP Referer header
+  referrer  String?  @db.Text
+  
+  /// Geo region (from IP lookup)
+  region    String?  @db.VarChar(50)
+  
+  /// Country code (ISO 3166-1 alpha-2)
+  country   String?  @db.VarChar(2)
+  
+  /// Whether this click appears to be from a bot
+  bot       Boolean  @default(false)
   
   // Relations
-  link      Link     @relation(fields: [linkId], references: [id])
+  link      Link     @relation(fields: [linkId], references: [id], onDelete: Cascade)
   
-  @@index([linkId])
-  @@index([clickedAt])
-  @@map("clicks")
+  // Indexes
+  /// Link-specific analytics queries
+  @@index([linkId], name: "idx_click_events_link_id")
+  
+  /// Time-range queries for analytics
+  @@index([createdAt], name: "idx_click_events_created_at")
+  
+  /// Combined index for link + time range (most common query pattern)
+  @@index([linkId, createdAt], name: "idx_click_events_link_time")
+  
+  /// Filter out bots
+  @@index([bot], name: "idx_click_events_bot")
+  
+  @@map("click_events")
+}
+
+// =============================================================================
+// AGGREGATED STATS (Pre-computed Daily Stats)
+// =============================================================================
+
+/// Pre-aggregated daily statistics per link
+/// 
+/// Purpose:
+/// - Fast dashboard queries without scanning click_events
+/// - Populated by background job (cron/worker)
+/// - One row per link per day
+/// 
+/// Trade-off:
+/// - Slight delay in stats (batch aggregation)
+/// - Much faster dashboard load times
+model AggregatedStat {
+  id        BigInt   @id @default(autoincrement())
+  
+  /// Reference to the link
+  linkId    BigInt   @map("link_id")
+  
+  /// Date for aggregation (no time component)
+  date      DateTime @db.Date
+  
+  /// Total clicks for this link on this date
+  clicks    BigInt   @default(0)
+  
+  /// Unique visitors (based on IP hash)
+  uniqueVisitors BigInt @default(0) @map("unique_visitors")
+  
+  // Relations
+  link      Link     @relation(fields: [linkId], references: [id], onDelete: Cascade)
+  
+  // Constraints
+  /// One row per link per day
+  @@unique([linkId, date], name: "uq_aggregated_stats_link_date")
+  
+  // Indexes
+  /// Date range queries for dashboards
+  @@index([date], name: "idx_aggregated_stats_date")
+  
+  /// Link-specific stats
+  @@index([linkId], name: "idx_aggregated_stats_link_id")
+  
+  @@map("aggregated_stats")
+}
+
+// =============================================================================
+// RESERVED ALIASES (Blocklist Management)
+// =============================================================================
+
+/// Reserved aliases that cannot be used as short codes
+/// 
+/// Purpose:
+/// - System routes (api, health, admin)
+/// - Brand protection
+/// - Offensive content filtering
+/// 
+/// Note: This supplements the in-memory blocklist in code.
+/// Database allows dynamic updates without deployment.
+model ReservedAlias {
+  id        BigInt   @id @default(autoincrement())
+  
+  /// The reserved alias (case-insensitive matching)
+  alias     String   @unique @db.VarChar(50)
+  
+  /// Why this alias is reserved
+  reason    String?  @db.Text
+  
+  /// Category for organization
+  category  String?  @db.VarChar(50)
+  
+  /// Who reserved it (admin user ID or "system")
+  reservedBy String? @map("reserved_by") @db.VarChar(100)
+  
+  // Timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  
+  // Indexes
+  /// Fast lookup for validation
+  @@index([alias], name: "idx_reserved_aliases_alias")
+  
+  /// Filter by category
+  @@index([category], name: "idx_reserved_aliases_category")
+  
+  @@map("reserved_aliases")
 }
